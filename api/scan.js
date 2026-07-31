@@ -244,17 +244,21 @@ async function fetchBars(symbol) {
 
 // ── GỬI TELEGRAM ────────────────────────────────────────────────
 async function sendMessage(text) {
-  const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: GROUP_ID,
-      text,
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-    }),
-  });
-  return res.json();
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: GROUP_ID,
+        text,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      }),
+    });
+    return await res.json();
+  } catch (err) {
+    return { ok: false, description: "Không gọi được API Telegram: " + err.message };
+  }
 }
 
 function buildMessage(symbol, dir, lv, barTime) {
@@ -286,6 +290,15 @@ export default async function handler(req, res) {
   const testMode = req.query?.test === "1"; // gửi thử tin nhắn, bỏ qua kiểm tra độ tươi
   const results = [];
 
+  // Cảnh báo sớm nếu quên khai báo biến môi trường
+  const missing = [];
+  if (!BOT_TOKEN) missing.push("BOT_TOKEN");
+  if (!GROUP_ID) missing.push("GROUP_ID");
+  if (!TD_API_KEY) missing.push("TD_API_KEY");
+  if (missing.length) {
+    return res.status(200).json({ ok: false, reason: "thiếu biến môi trường", missing });
+  }
+
   for (const symbol of SYMBOLS) {
     try {
       const bars = await fetchBars(symbol);
@@ -302,21 +315,22 @@ export default async function handler(req, res) {
 
       let sent = false;
       let skipReason = null;
+      let telegram = null;
 
       if (testMode && r.levels) {
-        await sendMessage(
+        telegram = await sendMessage(
           buildMessage(symbol, r.signal || "long", r.levels, r.barTime) +
             `\n\n⚠️ <i>Tin nhắn thử — không phải tín hiệu thật</i>`
         );
-        sent = true;
+        sent = telegram?.ok === true;
       } else if (r.signal && !r.levels) {
         skipReason = "thiếu ATR";
       } else if (r.signal && !isFresh) {
         // Nến cũ: hoặc dữ liệu chưa cập nhật, hoặc đã kiểm ở lần chạy trước
         skipReason = "nến cũ, bỏ qua để tránh gửi trùng";
       } else if (r.signal) {
-        await sendMessage(buildMessage(symbol, r.signal, r.levels, r.barTime));
-        sent = true;
+        telegram = await sendMessage(buildMessage(symbol, r.signal, r.levels, r.barTime));
+        sent = telegram?.ok === true;
       }
 
       results.push({
@@ -324,6 +338,8 @@ export default async function handler(req, res) {
         signal: r.signal,
         sent,
         skipReason,
+        // Telegram từ chối thì ghi rõ lý do ở đây
+        telegramError: telegram && !telegram.ok ? telegram.description : null,
         barTime: r.barTime,
         barAgeMin,
         isFresh,
