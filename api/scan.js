@@ -1,6 +1,6 @@
-// api/scan.js — Tự tính tín hiệu Cardwell trên khung H1, gửi lên Telegram
-// Biến môi trường cần có: BOT_TOKEN, GROUP_ID, TD_API_KEY, CRON_SECRET
-// Tùy chọn: SYMBOLS (mặc định "XAU/USD", nhiều cặp ngăn bằng dấu phẩy)
+// api/scan.js — Cardwell Range Analyze trên khung H1 → Telegram
+// Biến môi trường: BOT_TOKEN, GROUP_ID, TD_API_KEY, CRON_SECRET
+// Tùy chọn: SYMBOLS (mặc định "XAU/USD")
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const GROUP_ID = process.env.GROUP_ID;
@@ -12,7 +12,7 @@ const SYMBOLS = (process.env.SYMBOLS || "XAU/USD")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// ── CẤU HÌNH — khớp với input mặc định của indicator ───────────
+// ── CẤU HÌNH — khớp input mặc định của indicator ───────────────
 const CFG = {
   rsiLen: 14,
   trendLen: 50,
@@ -29,31 +29,32 @@ const CFG = {
   tp1Mult: 1.0,
   tp2Mult: 2.0,
   tp3Mult: 3.0,
-  digits: 3, // số chữ số thập phân khi hiển thị giá
 };
 
-const BARS = 400; // số nến tải về, đủ để chỉ báo ổn định
+// ── HIỂN THỊ ───────────────────────────────────────────────────
+const ENTRY_BAND_ATR = 0.1; // nới khoảng entry ±0.1 × ATR
+const SHOW_TP3 = false; // chỉ hiện TP1 và TP2
+const PRICE_DECIMALS = 0; // làm tròn số nguyên
 
-// Nến vừa đóng phải "tươi" hơn ngưỡng này thì mới gửi tín hiệu.
-// Đặt dưới 60 phút để lần chạy sau không đọc lại đúng cây nến cũ → chặn trùng.
-const MAX_BAR_AGE_MIN = 55;
+// Hiệu chỉnh lệch so với sàn/feed bạn dùng.
+// Để 0 cho tới khi gom đủ 5–10 tín hiệu và thấy rõ lệch một chiều.
+// Nếu server luôn cao hơn ~3 điểm thì đặt -3.
+const ENTRY_SHIFT = 0;
 
-// ── HÀM CHỈ BÁO (mô phỏng cách tính của Pine Script) ───────────
+const BARS = 400;
+const MAX_BAR_AGE_MIN = 55; // chặn gửi trùng khi cron đọc lại nến cũ
 
-// Làm trơn kiểu Wilder — Pine gọi là ta.rma
+// ── HÀM CHỈ BÁO (mô phỏng Pine Script) ─────────────────────────
 function rma(src, len) {
   const out = new Array(src.length).fill(null);
   let sum = 0;
   for (let i = 0; i < src.length; i++) {
     const v = src[i] ?? 0;
-    if (i < len - 1) {
-      sum += v;
-    } else if (i === len - 1) {
+    if (i < len - 1) sum += v;
+    else if (i === len - 1) {
       sum += v;
       out[i] = sum / len;
-    } else {
-      out[i] = (out[i - 1] * (len - 1) + v) / len;
-    }
+    } else out[i] = (out[i - 1] * (len - 1) + v) / len;
   }
   return out;
 }
@@ -99,7 +100,6 @@ function atr(bars, len) {
   return rma(trueRange(bars), len);
 }
 
-// ADX theo công thức ta.dmi của Pine
 function adx(bars, len) {
   const plusDM = [0];
   const minusDM = [0];
@@ -112,7 +112,6 @@ function adx(bars, len) {
   const trur = rma(trueRange(bars), len);
   const smPlus = rma(plusDM, len);
   const smMinus = rma(minusDM, len);
-
   const dx = bars.map((_, i) => {
     if (trur[i] == null || trur[i] === 0) return 0;
     const plus = (100 * smPlus[i]) / trur[i];
@@ -123,7 +122,7 @@ function adx(bars, len) {
   return rma(dx, len);
 }
 
-// ── LOGIC TÍN HIỆU ──────────────────────────────────────────────
+// ── LOGIC TÍN HIỆU ─────────────────────────────────────────────
 function analyze(bars) {
   const closes = bars.map((b) => b.close);
   const rsiArr = rsi(closes, CFG.rsiLen);
@@ -131,7 +130,7 @@ function analyze(bars) {
   const atrArr = atr(bars, CFG.atrLen);
   const adxArr = adx(bars, CFG.adxLen);
 
-  // Chạy lại toàn bộ lịch sử để đếm số nến xác nhận, giống hệt Pine
+  // Chạy lại toàn bộ lịch sử để đếm nến xác nhận, giống hệt Pine
   const regime = new Array(bars.length).fill(0);
   let bullCount = 0;
   let bearCount = 0;
@@ -166,23 +165,26 @@ function analyze(bars) {
   const isLong = state === 1 && prev !== 1 && chopOk;
   const isShort = state === -1 && prev !== -1 && chopOk;
 
-  // Pine dùng entry = close[1], tức nến ngay trước nến tín hiệu
-  const entry = closes[n - 1];
+  // Pine: entry = close[1], tức nến ngay trước nến tín hiệu
+  const entry = closes[n - 1] + ENTRY_SHIFT;
   const a = atrArr[n];
+  const band = a == null ? null : a * ENTRY_BAND_ATR;
 
   const levels =
     a == null
       ? null
       : isLong
       ? {
-          entry,
+          entryLo: entry - band,
+          entryHi: entry + band,
           sl: entry - a * CFG.slMult,
           tp1: entry + a * CFG.tp1Mult,
           tp2: entry + a * CFG.tp2Mult,
           tp3: entry + a * CFG.tp3Mult,
         }
       : {
-          entry,
+          entryLo: entry - band,
+          entryHi: entry + band,
           sl: entry + a * CFG.slMult,
           tp1: entry - a * CFG.tp1Mult,
           tp2: entry - a * CFG.tp2Mult,
@@ -194,11 +196,17 @@ function analyze(bars) {
     levels,
     barTime: bars[n].datetime,
     barTs: bars[n].ts,
+    reason: {
+      rsi: rsiArr[n],
+      close: closes[n],
+      sma50: maArr[n],
+      adx: adxArr[n],
+    },
     debug: {
       close: closes[n],
       rsi: round(rsiArr[n], 2),
-      sma50: round(maArr[n], CFG.digits),
-      atr: round(a, CFG.digits),
+      sma50: round(maArr[n], 3),
+      atr: round(a, 3),
       adx: round(adxArr[n], 2),
       regimeNow: state,
       regimePrev: prev,
@@ -210,18 +218,27 @@ function round(v, d) {
   return v == null ? null : Number(v.toFixed(d));
 }
 
-function fmt(v) {
-  return v.toFixed(CFG.digits);
+function p(v) {
+  return v.toFixed(PRICE_DECIMALS);
 }
 
-// ── TẢI DỮ LIỆU ─────────────────────────────────────────────────
+// ── LÝ DO VÀO LỆNH (ngắn gọn) ──────────────────────────────────
+function buildReason(dir, r) {
+  const isBuy = dir === "long";
+  const vung = isBuy
+    ? `vùng tăng (${CFG.bullLo}–${CFG.bullHi})`
+    : `vùng giảm (${CFG.bearLo}–${CFG.bearHi})`;
+  const viTri = isBuy ? "trên" : "dưới";
+  return `RSI ${r.rsi.toFixed(1)} nằm trong ${vung}, giá nằm ${viTri} SMA50.`;
+}
+
+// ── TẢI DỮ LIỆU ────────────────────────────────────────────────
 async function fetchBars(symbol) {
   const url =
     `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}` +
     `&interval=1h&outputsize=${BARS}&order=ASC&timezone=UTC&apikey=${TD_API_KEY}`;
 
-  const res = await fetch(url);
-  const json = await res.json();
+  const json = await (await fetch(url)).json();
 
   if (json.status === "error" || !Array.isArray(json.values)) {
     throw new Error(json.message || "Không lấy được dữ liệu");
@@ -233,16 +250,14 @@ async function fetchBars(symbol) {
     high: parseFloat(v.high),
     low: parseFloat(v.low),
     close: parseFloat(v.close),
-    // Twelve Data trả giờ dạng "YYYY-MM-DD HH:mm:ss", ép về UTC
     ts: Date.parse(v.datetime.replace(" ", "T") + "Z"),
   }));
 
-  // Bỏ cây nến đang chạy dở, chỉ giữ nến đã đóng
   const now = Date.now();
-  return bars.filter((b) => b.ts + 3600 * 1000 <= now);
+  return bars.filter((b) => b.ts + 3600 * 1000 <= now); // bỏ nến đang chạy dở
 }
 
-// ── GỬI TELEGRAM ────────────────────────────────────────────────
+// ── GỬI TELEGRAM ───────────────────────────────────────────────
 async function sendMessage(text) {
   try {
     const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
@@ -261,24 +276,25 @@ async function sendMessage(text) {
   }
 }
 
-function buildMessage(symbol, dir, lv, barTime) {
-  const isBuy = dir === "long";
-  return [
-    `${isBuy ? "🟢" : "🔴"} <b>${isBuy ? "BUY" : "SELL"}</b> — <b>${symbol}</b> (H1)`,
-    ``,
-    `Entry: <code>${fmt(lv.entry)}</code>`,
-    `SL: <code>${fmt(lv.sl)}</code>`,
-    `TP1: <code>${fmt(lv.tp1)}</code>`,
-    `TP2: <code>${fmt(lv.tp2)}</code>`,
-    `TP3: <code>${fmt(lv.tp3)}</code>`,
-    ``,
-    `<i>Cardwell RSI · nến ${barTime} UTC</i>`,
-  ].join("\n");
+function buildMessage(dir, lv, reason) {
+  const side = dir === "long" ? "BUY" : "SELL";
+
+  const lines = [
+    `<b>${side}: ${p(lv.entryLo)} - ${p(lv.entryHi)}</b>`,
+    `SL: <code>${p(lv.sl)}</code>`,
+    `TP1: <code>${p(lv.tp1)}</code>`,
+    `TP2: <code>${p(lv.tp2)}</code>`,
+  ];
+
+  if (SHOW_TP3) lines.push(`TP3: <code>${p(lv.tp3)}</code>`);
+
+  lines.push(``, `📌 <b>Lý do vào lệnh:</b>`, buildReason(dir, reason));
+
+  return lines.join("\n");
 }
 
-// ── HANDLER ─────────────────────────────────────────────────────
+// ── HANDLER ────────────────────────────────────────────────────
 export default async function handler(req, res) {
-  // Chặn người lạ gọi bừa
   if (CRON_SECRET) {
     const key = req.headers["x-cron-key"] || req.query?.key;
     if (key !== CRON_SECRET) {
@@ -287,10 +303,9 @@ export default async function handler(req, res) {
   }
 
   const debugMode = req.query?.debug === "1";
-  const testMode = req.query?.test === "1"; // gửi thử tin nhắn, bỏ qua kiểm tra độ tươi
+  const testMode = req.query?.test === "1";
   const results = [];
 
-  // Cảnh báo sớm nếu quên khai báo biến môi trường
   const missing = [];
   if (!BOT_TOKEN) missing.push("BOT_TOKEN");
   if (!GROUP_ID) missing.push("GROUP_ID");
@@ -308,8 +323,6 @@ export default async function handler(req, res) {
       }
 
       const r = analyze(bars);
-
-      // Nến này đóng cách đây bao nhiêu phút?
       const barAgeMin = Math.round((Date.now() - (r.barTs + 3600 * 1000)) / 60000);
       const isFresh = barAgeMin <= MAX_BAR_AGE_MIN;
 
@@ -319,17 +332,16 @@ export default async function handler(req, res) {
 
       if (testMode && r.levels) {
         telegram = await sendMessage(
-          buildMessage(symbol, r.signal || "long", r.levels, r.barTime) +
+          buildMessage(r.signal || "short", r.levels, r.reason) +
             `\n\n⚠️ <i>Tin nhắn thử — không phải tín hiệu thật</i>`
         );
         sent = telegram?.ok === true;
       } else if (r.signal && !r.levels) {
         skipReason = "thiếu ATR";
       } else if (r.signal && !isFresh) {
-        // Nến cũ: hoặc dữ liệu chưa cập nhật, hoặc đã kiểm ở lần chạy trước
         skipReason = "nến cũ, bỏ qua để tránh gửi trùng";
       } else if (r.signal) {
-        telegram = await sendMessage(buildMessage(symbol, r.signal, r.levels, r.barTime));
+        telegram = await sendMessage(buildMessage(r.signal, r.levels, r.reason));
         sent = telegram?.ok === true;
       }
 
@@ -338,7 +350,6 @@ export default async function handler(req, res) {
         signal: r.signal,
         sent,
         skipReason,
-        // Telegram từ chối thì ghi rõ lý do ở đây
         telegramError: telegram && !telegram.ok ? telegram.description : null,
         barTime: r.barTime,
         barAgeMin,
