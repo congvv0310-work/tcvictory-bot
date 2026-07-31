@@ -1,15 +1,28 @@
-// api/backtest.js — Chạy lại 3 chỉ báo qua toàn bộ lịch sử, thống kê thắng/thua
+// api/backtest.js — Chạy lại chỉ báo qua lịch sử, thống kê + phát lại tín hiệu
 //
-// Cách gọi:
-//   /api/backtest?key=BI_MAT&tf=15min&bars=5000
-//   /api/backtest?key=BI_MAT&tf=1h&bars=5000&trades=1   (kèm danh sách lệnh)
+// Thống kê:
+//   /api/backtest?key=BI_MAT&tf=1h
+//   /api/backtest?key=BI_MAT&tf=15min&only=cardwell&trades=1
 //
-// LƯU Ý BẢO TRÌ: file này chứa bản sao logic chỉ báo của scan.js.
-// Nếu sửa tham số chỉ báo bên scan.js thì phải sửa cả ở đây, không thì
-// kết quả backtest sẽ không còn phản ánh thứ đang chạy thật.
+// Phát lại tín hiệu thật lên Telegram (để kiểm thử):
+//   /api/backtest?key=BI_MAT&tf=1h&send=3
+//   /api/backtest?key=BI_MAT&tf=1h&only=cardwell&send=1
+//
+// Tham số:
+//   tf     5min | 15min | 30min | 1h | 4h | 1day   (mặc định 1h)
+//   only   cardwell | fan | elliott                (bỏ trống = cả ba)
+//   bars   số nến, tối đa 5000
+//   hold   giữ tối đa bao nhiêu nến                (mặc định 100)
+//   trades =1 để xem danh sách lệnh
+//   send   =N gửi N tín hiệu gần nhất lên Telegram
 
 const TD_API_KEY = process.env.TD_API_KEY;
 const CRON_SECRET = process.env.CRON_SECRET || "";
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const GROUP_ID = process.env.GROUP_ID;
+
+const ENTRY_BAND_ATR = 0.1;
+const PRICE_DECIMALS = 0;
 
 const CARDWELL = {
   rsiLen: 14, trendLen: 50,
@@ -103,7 +116,7 @@ function adx(bars, len) {
   return rma(dx, len);
 }
 
-// ── QUÉT TOÀN BỘ TÍN HIỆU: CARDWELL ────────────────────────────
+// ── QUÉT TÍN HIỆU: CARDWELL ────────────────────────────────────
 function scanCardwell(bars) {
   const C = CARDWELL;
   const closes = bars.map((b) => b.close);
@@ -134,17 +147,22 @@ function scanCardwell(bars) {
       const entry = closes[i - 1];
       const a = atrArr[i];
       const d = isLong ? 1 : -1;
+      const vung = isLong
+        ? `vùng tăng (${C.bullLo}–${C.bullHi})`
+        : `vùng giảm (${C.bearLo}–${C.bearHi})`;
       out.push({
         i, dir: isLong ? "long" : "short", time: bars[i].datetime,
         entry, sl: entry - d * a * C.slMult,
         tp1: entry + d * a * C.tp1Mult, tp2: entry + d * a * C.tp2Mult,
+        atrNow: a,
+        reason: `RSI ${rsiArr[i].toFixed(1)} nằm trong ${vung}, giá nằm ${isLong ? "trên" : "dưới"} SMA50.`,
       });
     }
   }
   return out;
 }
 
-// ── QUÉT TOÀN BỘ TÍN HIỆU: FAN PRINCIPLE ───────────────────────
+// ── QUÉT TÍN HIỆU: FAN PRINCIPLE ───────────────────────────────
 function scanFan(bars) {
   const F = FAN;
   const closes = bars.map((b) => b.close);
@@ -196,7 +214,6 @@ function scanFan(bars) {
       }
     }
 
-    // Kiểm tra phá vỡ tại nến này
     if (fanM3 == null || fanDir === 0 || i < 3) continue;
     const lineAt = (x) => originVal + fanM3 * (x - originBar);
     const fPrev = lineAt(i - 1), fPrev2 = lineAt(i - 2);
@@ -205,7 +222,7 @@ function scanFan(bars) {
     if (!bull && !bear) continue;
 
     const aPrev = atrArr[i - 1];
-    if (aPrev == null) continue;
+    if (aPrev == null || atrArr[i] == null) continue;
     const entry = closes[i - 1];
     let risk;
     if (bull) {
@@ -221,12 +238,14 @@ function scanFan(bars) {
       i, dir: bull ? "long" : "short", time: bars[i].datetime,
       entry, sl: entry - d * risk,
       tp1: entry + d * risk * F.tp1R, tp2: entry + d * risk * F.tp2R,
+      atrNow: atrArr[i],
+      reason: `Giá phá ${bull ? "lên" : "xuống"} đường quạt số 3 (mức ${fPrev.toFixed(PRICE_DECIMALS)}), quạt dựng từ ${bull ? "4 đáy" : "4 đỉnh"} liên tiếp.`,
     });
   }
   return out;
 }
 
-// ── QUÉT TOÀN BỘ TÍN HIỆU: ELLIOTT WAVE ────────────────────────
+// ── QUÉT TÍN HIỆU: ELLIOTT WAVE ────────────────────────────────
 function scanElliott(bars) {
   const E = ELLIOTT;
   const atrArr = atr(bars, 14);
@@ -269,6 +288,7 @@ function scanElliott(bars) {
 
     return {
       type: 1, dir: isBull ? "long" : "short",
+      ten: isBull ? "Sóng đẩy tăng (1-2-3-4-5)" : "Sóng đẩy giảm (1-2-3-4-5)",
       entry, sl: stop, tp1, tp2: p5.p + s * w3 * 1.0,
       start: p0.i, end: p5.i,
     };
@@ -297,7 +317,11 @@ function scanElliott(bars) {
     const risk = Math.abs(entry - stop);
     if (!(risk > 1e-10 && Math.abs(tp2 - entry) / risk >= E.minRr)) return null;
 
-    return { type: 2, dir: isBull ? "long" : "short", entry, sl: stop, tp1, tp2, start: wa.i, end: wc.i };
+    return {
+      type: 2, dir: isBull ? "long" : "short",
+      ten: isBull ? "Sóng điều chỉnh ABC tăng" : "Sóng điều chỉnh ABC giảm",
+      entry, sl: stop, tp1, tp2, start: wa.i, end: wc.i,
+    };
   }
 
   for (let i = 0; i < bars.length; i++) {
@@ -332,15 +356,19 @@ function scanElliott(bars) {
       frozenIdx = res.start;
       patHistory.push({ type: res.type, start: res.start, end: res.end });
       while (patHistory.length > E.maxPatterns) patHistory.shift();
-      out.push({ i, dir: res.dir, time: bars[i].datetime, entry: res.entry, sl: res.sl, tp1: res.tp1, tp2: res.tp2 });
+      out.push({
+        i, dir: res.dir, time: bars[i].datetime,
+        entry: res.entry, sl: res.sl, tp1: res.tp1, tp2: res.tp2,
+        atrNow: a,
+        reason: `Nhận diện ${res.ten}, các tỷ lệ Fibonacci giữa các sóng nằm trong ngưỡng cho phép.`,
+      });
     }
   }
   return out;
 }
 
 // ── MÔ PHỎNG LỆNH ──────────────────────────────────────────────
-// Quy ước: nếu trong cùng một nến giá chạm cả SL lẫn TP, tính là SL trước
-// (giả định thận trọng, vì dữ liệu OHLC không cho biết thứ tự thực tế).
+// Cùng nến chạm cả SL lẫn TP thì tính SL trước (giả định thận trọng).
 function simulate(bars, sig, maxHold) {
   const d = sig.dir === "long" ? 1 : -1;
   const risk = Math.abs(sig.entry - sig.sl);
@@ -361,8 +389,8 @@ function simulate(bars, sig, maxHold) {
     if (chamTP1) tp1Hit = true;
   }
 
-  const last = bars[Math.min(sig.i + maxHold, bars.length - 1)].close;
-  return { ket: tp1Hit ? "TP1" : "HET_HAN", R: (d * (last - sig.entry)) / risk, soNen: maxHold };
+  const cuoi = bars[Math.min(sig.i + maxHold, bars.length - 1)].close;
+  return { ket: tp1Hit ? "TP1" : "HET_HAN", R: (d * (cuoi - sig.entry)) / risk, soNen: maxHold };
 }
 
 function thongKe(ten, sigs, bars, maxHold) {
@@ -379,14 +407,54 @@ function thongKe(ten, sigs, bars, maxHold) {
 
   return {
     chiBao: ten,
-    soLenh: n,
-    thang, thua, hetHan,
+    soLenh: n, thang, thua, hetHan,
     tyLeThang: n ? Math.round((thang / n) * 100) + "%" : "—",
     tongR: Math.round(tongR * 100) / 100,
     trungBinhR: n ? Math.round((tongR / n) * 100) / 100 : 0,
     chamTP2: trades.filter((t) => t.ket === "TP2").length,
     _trades: trades,
   };
+}
+
+// ── GỬI TELEGRAM (phát lại tín hiệu cũ) ────────────────────────
+function p(v) { return v.toFixed(PRICE_DECIMALS); }
+
+async function sendMessage(text) {
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: GROUP_ID, text,
+        parse_mode: "HTML", disable_web_page_preview: true,
+      }),
+    });
+    return await res.json();
+  } catch (err) {
+    return { ok: false, description: err.message };
+  }
+}
+
+function buildReplayMessage(sig, nguon, khung, ketQua) {
+  const side = sig.dir === "long" ? "BUY" : "SELL";
+  const band = (sig.atrNow || 0) * ENTRY_BAND_ATR;
+  const lines = [
+    `🔁 <b>PHÁT LẠI TÍN HIỆU CŨ</b> — ${sig.time} UTC (${khung})`,
+    ``,
+    `<b>${side}: ${p(sig.entry - band)} - ${p(sig.entry + band)}</b>`,
+    `SL: <code>${p(sig.sl)}</code>`,
+    `TP1: <code>${p(sig.tp1)}</code>`,
+    `TP2: <code>${p(sig.tp2)}</code>`,
+    ``,
+    `📌 <b>Lý do vào lệnh:</b>`,
+    sig.reason || "—",
+    ``,
+    `<i>Nguồn: ${nguon}</i>`,
+  ];
+  if (ketQua) {
+    lines.push(`<i>Kết quả thực tế: ${ketQua.ket} (${ketQua.R > 0 ? "+" : ""}${Math.round(ketQua.R * 100) / 100}R sau ${ketQua.soNen} nến)</i>`);
+  }
+  return lines.join("\n");
 }
 
 // ── TẢI DỮ LIỆU ────────────────────────────────────────────────
@@ -418,6 +486,7 @@ export default async function handler(req, res) {
   const maxHold = parseInt(req.query?.hold || "100", 10);
   const showTrades = req.query?.trades === "1";
   const only = (req.query?.only || "").toLowerCase();
+  const soGui = Math.min(parseInt(req.query?.send || "0", 10) || 0, 10);
 
   try {
     const bars = await fetchBars(symbol, tf, nBars);
@@ -433,6 +502,26 @@ export default async function handler(req, res) {
 
     const ketQua = bo.map((x) => thongKe(x.ten, x.quet(bars), bars, maxHold));
 
+    // Phát lại N tín hiệu gần nhất lên Telegram
+    let daGui = null;
+    if (soGui > 0) {
+      if (!BOT_TOKEN || !GROUP_ID) {
+        daGui = { loi: "Thiếu BOT_TOKEN hoặc GROUP_ID" };
+      } else {
+        const gui = [];
+        for (const r of ketQua) {
+          const lay = r._trades.slice(-soGui);
+          for (const t of lay) {
+            const tg = await sendMessage(
+              buildReplayMessage(t, r.chiBao, tf, { ket: t.ket, R: t.R, soNen: t.soNen })
+            );
+            gui.push({ chiBao: r.chiBao, thoiGian: t.time, huong: t.dir, ok: tg?.ok === true, loi: tg?.ok ? null : tg?.description });
+          }
+        }
+        daGui = gui;
+      }
+    }
+
     return res.status(200).json({
       ok: true,
       symbol, khung: tf,
@@ -440,16 +529,22 @@ export default async function handler(req, res) {
       tuNgay: bars[0].datetime,
       denNgay: bars[bars.length - 1].datetime,
       giuToiDa: maxHold + " nến",
-      giaDinh: "Trong cùng nến chạm cả SL và TP thì tính SL trước. Chưa trừ spread và phí.",
+      giaDinh: "Cùng nến chạm cả SL và TP thì tính SL trước. Chưa trừ spread và phí.",
       ketQua: ketQua.map(({ _trades, ...r }) => r),
+      ...(daGui ? { daGuiTelegram: daGui } : {}),
       ...(showTrades
-        ? { danhSachLenh: ketQua.map((r) => ({ chiBao: r.chiBao, lenh: r._trades.map((t) => ({
-            thoiGian: t.time, huong: t.dir,
-            entry: Math.round(t.entry * 100) / 100,
-            sl: Math.round(t.sl * 100) / 100,
-            tp1: Math.round(t.tp1 * 100) / 100,
-            ketQua: t.ket, R: Math.round(t.R * 100) / 100, soNen: t.soNen,
-          })) })) }
+        ? {
+            danhSachLenh: ketQua.map((r) => ({
+              chiBao: r.chiBao,
+              lenh: r._trades.map((t) => ({
+                thoiGian: t.time, huong: t.dir,
+                entry: Math.round(t.entry * 100) / 100,
+                sl: Math.round(t.sl * 100) / 100,
+                tp1: Math.round(t.tp1 * 100) / 100,
+                ketQua: t.ket, R: Math.round(t.R * 100) / 100, soNen: t.soNen,
+              })),
+            })),
+          }
         : {}),
     });
   } catch (err) {
