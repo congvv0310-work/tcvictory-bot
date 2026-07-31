@@ -34,6 +34,10 @@ const CFG = {
 
 const BARS = 400; // số nến tải về, đủ để chỉ báo ổn định
 
+// Nến vừa đóng phải "tươi" hơn ngưỡng này thì mới gửi tín hiệu.
+// Đặt dưới 60 phút để lần chạy sau không đọc lại đúng cây nến cũ → chặn trùng.
+const MAX_BAR_AGE_MIN = 55;
+
 // ── HÀM CHỈ BÁO (mô phỏng cách tính của Pine Script) ───────────
 
 // Làm trơn kiểu Wilder — Pine gọi là ta.rma
@@ -83,7 +87,6 @@ function rsi(closes, len) {
   });
 }
 
-// True Range
 function trueRange(bars) {
   return bars.map((b, i) => {
     if (i === 0) return b.high - b.low;
@@ -167,26 +170,30 @@ function analyze(bars) {
   const entry = closes[n - 1];
   const a = atrArr[n];
 
-  const levels = isLong
-    ? {
-        entry,
-        sl: entry - a * CFG.slMult,
-        tp1: entry + a * CFG.tp1Mult,
-        tp2: entry + a * CFG.tp2Mult,
-        tp3: entry + a * CFG.tp3Mult,
-      }
-    : {
-        entry,
-        sl: entry + a * CFG.slMult,
-        tp1: entry - a * CFG.tp1Mult,
-        tp2: entry - a * CFG.tp2Mult,
-        tp3: entry - a * CFG.tp3Mult,
-      };
+  const levels =
+    a == null
+      ? null
+      : isLong
+      ? {
+          entry,
+          sl: entry - a * CFG.slMult,
+          tp1: entry + a * CFG.tp1Mult,
+          tp2: entry + a * CFG.tp2Mult,
+          tp3: entry + a * CFG.tp3Mult,
+        }
+      : {
+          entry,
+          sl: entry + a * CFG.slMult,
+          tp1: entry - a * CFG.tp1Mult,
+          tp2: entry - a * CFG.tp2Mult,
+          tp3: entry - a * CFG.tp3Mult,
+        };
 
   return {
     signal: isLong ? "long" : isShort ? "short" : null,
     levels,
     barTime: bars[n].datetime,
+    barTs: bars[n].ts,
     debug: {
       close: closes[n],
       rsi: round(rsiArr[n], 2),
@@ -276,7 +283,7 @@ export default async function handler(req, res) {
   }
 
   const debugMode = req.query?.debug === "1";
-  const testMode = req.query?.test === "1"; // gửi thử tin nhắn dù không có tín hiệu
+  const testMode = req.query?.test === "1"; // gửi thử tin nhắn, bỏ qua kiểm tra độ tươi
   const results = [];
 
   for (const symbol of SYMBOLS) {
@@ -289,19 +296,37 @@ export default async function handler(req, res) {
 
       const r = analyze(bars);
 
-      if (r.signal) {
-        await sendMessage(buildMessage(symbol, r.signal, r.levels, r.barTime));
-      } else if (testMode) {
+      // Nến này đóng cách đây bao nhiêu phút?
+      const barAgeMin = Math.round((Date.now() - (r.barTs + 3600 * 1000)) / 60000);
+      const isFresh = barAgeMin <= MAX_BAR_AGE_MIN;
+
+      let sent = false;
+      let skipReason = null;
+
+      if (testMode && r.levels) {
         await sendMessage(
-          buildMessage(symbol, "long", r.levels, r.barTime) +
+          buildMessage(symbol, r.signal || "long", r.levels, r.barTime) +
             `\n\n⚠️ <i>Tin nhắn thử — không phải tín hiệu thật</i>`
         );
+        sent = true;
+      } else if (r.signal && !r.levels) {
+        skipReason = "thiếu ATR";
+      } else if (r.signal && !isFresh) {
+        // Nến cũ: hoặc dữ liệu chưa cập nhật, hoặc đã kiểm ở lần chạy trước
+        skipReason = "nến cũ, bỏ qua để tránh gửi trùng";
+      } else if (r.signal) {
+        await sendMessage(buildMessage(symbol, r.signal, r.levels, r.barTime));
+        sent = true;
       }
 
       results.push({
         symbol,
         signal: r.signal,
+        sent,
+        skipReason,
         barTime: r.barTime,
+        barAgeMin,
+        isFresh,
         barsUsed: bars.length,
         ...(debugMode ? { debug: r.debug, levels: r.levels } : {}),
       });
