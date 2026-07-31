@@ -1,4 +1,5 @@
-// api/scan.js — Cardwell Range Analyze trên khung H1 → Telegram
+// api/scan.js — Quét tín hiệu H1 từ nhiều chỉ báo → Telegram
+// Chỉ báo: Cardwell Range Analyze, Fan Principle Signals
 // Biến môi trường: BOT_TOKEN, GROUP_ID, TD_API_KEY, CRON_SECRET
 // Tùy chọn: SYMBOLS (mặc định "XAU/USD")
 
@@ -12,8 +13,17 @@ const SYMBOLS = (process.env.SYMBOLS || "XAU/USD")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// ── CẤU HÌNH — khớp input mặc định của indicator ───────────────
-const CFG = {
+// ── HIỂN THỊ ───────────────────────────────────────────────────
+const ENTRY_BAND_ATR = 0.1; // nới khoảng entry ±0.1 × ATR
+const SHOW_TP3 = false; // chỉ hiện TP1 và TP2
+const PRICE_DECIMALS = 0; // làm tròn số nguyên
+const ENTRY_SHIFT = 0; // hiệu chỉnh lệch feed, để 0 cho tới khi gom đủ mẫu
+
+const BARS = 500;
+const MAX_BAR_AGE_MIN = 55; // chặn gửi trùng khi cron đọc lại nến cũ
+
+// ── CẤU HÌNH CHỈ BÁO ───────────────────────────────────────────
+const CARDWELL = {
   rsiLen: 14,
   trendLen: 50,
   bullLo: 40,
@@ -31,20 +41,20 @@ const CFG = {
   tp3Mult: 3.0,
 };
 
-// ── HIỂN THỊ ───────────────────────────────────────────────────
-const ENTRY_BAND_ATR = 0.1; // nới khoảng entry ±0.1 × ATR
-const SHOW_TP3 = false; // chỉ hiện TP1 và TP2
-const PRICE_DECIMALS = 0; // làm tròn số nguyên
+const FAN = {
+  pivLen: 5,
+  maxFanBars: 300,
+  minLegPct: 0.1,
+  atrLen: 14,
+  slBufAtr: 0.1,
+  slMaxAtr: 3.0,
+  tp1R: 1.0,
+  tp2R: 2.0,
+  tp3R: 3.0,
+  maxPivots: 20,
+};
 
-// Hiệu chỉnh lệch so với sàn/feed bạn dùng.
-// Để 0 cho tới khi gom đủ 5–10 tín hiệu và thấy rõ lệch một chiều.
-// Nếu server luôn cao hơn ~3 điểm thì đặt -3.
-const ENTRY_SHIFT = 0;
-
-const BARS = 400;
-const MAX_BAR_AGE_MIN = 55; // chặn gửi trùng khi cron đọc lại nến cũ
-
-// ── HÀM CHỈ BÁO (mô phỏng Pine Script) ─────────────────────────
+// ── HÀM CHUNG ──────────────────────────────────────────────────
 function rma(src, len) {
   const out = new Array(src.length).fill(null);
   let sum = 0;
@@ -122,15 +132,39 @@ function adx(bars, len) {
   return rma(dx, len);
 }
 
-// ── LOGIC TÍN HIỆU ─────────────────────────────────────────────
-function analyze(bars) {
-  const closes = bars.map((b) => b.close);
-  const rsiArr = rsi(closes, CFG.rsiLen);
-  const maArr = sma(closes, CFG.trendLen);
-  const atrArr = atr(bars, CFG.atrLen);
-  const adxArr = adx(bars, CFG.adxLen);
+function round(v, d) {
+  return v == null ? null : Number(v.toFixed(d));
+}
 
-  // Chạy lại toàn bộ lịch sử để đếm nến xác nhận, giống hệt Pine
+function p(v) {
+  return v.toFixed(PRICE_DECIMALS);
+}
+
+// Ghép khoảng entry và các mức từ entry + rủi ro
+function makeLevels(isLong, entryRaw, risk, atrNow, mults) {
+  const entry = entryRaw + ENTRY_SHIFT;
+  const band = atrNow * ENTRY_BAND_ATR;
+  const dir = isLong ? 1 : -1;
+  return {
+    entryLo: entry - band,
+    entryHi: entry + band,
+    sl: entry - dir * risk,
+    tp1: entry + dir * risk * mults[0],
+    tp2: entry + dir * risk * mults[1],
+    tp3: entry + dir * risk * mults[2],
+  };
+}
+
+// ── CHỈ BÁO 1: CARDWELL RANGE ANALYZE ──────────────────────────
+function analyzeCardwell(bars) {
+  const C = CARDWELL;
+  const closes = bars.map((b) => b.close);
+  const rsiArr = rsi(closes, C.rsiLen);
+  const maArr = sma(closes, C.trendLen);
+  const atrArr = atr(bars, C.atrLen);
+  const adxArr = adx(bars, C.adxLen);
+
+  // Chạy lại lịch sử để đếm nến xác nhận, giống hệt Pine
   const regime = new Array(bars.length).fill(0);
   let bullCount = 0;
   let bearCount = 0;
@@ -143,8 +177,8 @@ function analyze(bars) {
     }
     const isUp = closes[i] > maArr[i];
     const isDown = closes[i] < maArr[i];
-    const inBull = rsiArr[i] >= CFG.bullLo && rsiArr[i] <= CFG.bullHi;
-    const inBear = rsiArr[i] >= CFG.bearLo && rsiArr[i] <= CFG.bearHi;
+    const inBull = rsiArr[i] >= C.bullLo && rsiArr[i] <= C.bullHi;
+    const inBear = rsiArr[i] >= C.bearLo && rsiArr[i] <= C.bearHi;
 
     const bullRaw = isUp && inBull;
     const bearRaw = isDown && inBear;
@@ -152,58 +186,46 @@ function analyze(bars) {
     bullCount = bullRaw ? bullCount + 1 : 0;
     bearCount = bearRaw ? bearCount + 1 : 0;
 
-    const bull = bullRaw && bullCount >= CFG.confirmBars;
-    const bear = bearRaw && bearCount >= CFG.confirmBars;
-    regime[i] = bull ? 1 : bear ? -1 : 0;
+    regime[i] =
+      bullRaw && bullCount >= C.confirmBars
+        ? 1
+        : bearRaw && bearCount >= C.confirmBars
+        ? -1
+        : 0;
   }
 
-  const n = bars.length - 1; // nến vừa đóng
+  const n = bars.length - 1;
   const state = regime[n];
   const prev = regime[n - 1];
 
-  const chopOk = !CFG.useAdx || (adxArr[n] != null && adxArr[n] >= CFG.adxMin);
+  const chopOk = !C.useAdx || (adxArr[n] != null && adxArr[n] >= C.adxMin);
   const isLong = state === 1 && prev !== 1 && chopOk;
   const isShort = state === -1 && prev !== -1 && chopOk;
+  const signal = isLong ? "long" : isShort ? "short" : null;
 
-  // Pine: entry = close[1], tức nến ngay trước nến tín hiệu
-  const entry = closes[n - 1] + ENTRY_SHIFT;
   const a = atrArr[n];
-  const band = a == null ? null : a * ENTRY_BAND_ATR;
-
   const levels =
     a == null
       ? null
-      : isLong
-      ? {
-          entryLo: entry - band,
-          entryHi: entry + band,
-          sl: entry - a * CFG.slMult,
-          tp1: entry + a * CFG.tp1Mult,
-          tp2: entry + a * CFG.tp2Mult,
-          tp3: entry + a * CFG.tp3Mult,
-        }
-      : {
-          entryLo: entry - band,
-          entryHi: entry + band,
-          sl: entry + a * CFG.slMult,
-          tp1: entry - a * CFG.tp1Mult,
-          tp2: entry - a * CFG.tp2Mult,
-          tp3: entry - a * CFG.tp3Mult,
-        };
+      : makeLevels(isLong, closes[n - 1], a * C.slMult, a, [
+          C.tp1Mult / C.slMult,
+          C.tp2Mult / C.slMult,
+          C.tp3Mult / C.slMult,
+        ]);
+
+  const vung = isLong
+    ? `vùng tăng (${C.bullLo}–${C.bullHi})`
+    : `vùng giảm (${C.bearLo}–${C.bearHi})`;
+  const viTri = isLong ? "trên" : "dưới";
 
   return {
-    signal: isLong ? "long" : isShort ? "short" : null,
+    signal,
     levels,
-    barTime: bars[n].datetime,
-    barTs: bars[n].ts,
-    reason: {
-      rsi: rsiArr[n],
-      close: closes[n],
-      sma50: maArr[n],
-      adx: adxArr[n],
-    },
+    reason:
+      rsiArr[n] == null
+        ? ""
+        : `RSI ${rsiArr[n].toFixed(1)} nằm trong ${vung}, giá nằm ${viTri} SMA50.`,
     debug: {
-      close: closes[n],
       rsi: round(rsiArr[n], 2),
       sma50: round(maArr[n], 3),
       atr: round(a, 3),
@@ -214,23 +236,189 @@ function analyze(bars) {
   };
 }
 
-function round(v, d) {
-  return v == null ? null : Number(v.toFixed(d));
+// ── CHỈ BÁO 2: FAN PRINCIPLE SIGNALS ───────────────────────────
+function analyzeFan(bars) {
+  const F = FAN;
+  const closes = bars.map((b) => b.close);
+  const atrArr = atr(bars, F.atrLen);
+  const L = F.pivLen;
+
+  const loBar = [];
+  const loVal = [];
+  const hiBar = [];
+  const hiVal = [];
+
+  // Trạng thái quạt, giữ qua từng nến giống biến var của Pine
+  let originBar = null;
+  let originVal = null;
+  let fanDir = 0;
+  let fL2Val = null;
+  let fL3Bar = null;
+  let fL3Val = null;
+  let fanM3 = null;
+
+  const slope = (x1, y1, x2, y2) => (x2 !== x1 ? (y2 - y1) / (x2 - x1) : 0);
+
+  for (let i = 0; i < bars.length; i++) {
+    // Tìm pivot: tâm cách hiện tại L nến, cửa sổ rộng 2L+1
+    if (i >= 2 * L) {
+      const j = i - L;
+      let isHigh = true;
+      let isLow = true;
+      const candH = bars[j].high;
+      const candL = bars[j].low;
+      for (let k = i - 2 * L; k <= i; k++) {
+        if (k === j) continue;
+        if (bars[k].high >= candH) isHigh = false;
+        if (bars[k].low <= candL) isLow = false;
+      }
+      if (isLow) {
+        loBar.push(j);
+        loVal.push(candL);
+        if (loBar.length > F.maxPivots) {
+          loBar.shift();
+          loVal.shift();
+        }
+      }
+      if (isHigh) {
+        hiBar.push(j);
+        hiVal.push(candH);
+        if (hiBar.length > F.maxPivots) {
+          hiBar.shift();
+          hiVal.shift();
+        }
+      }
+    }
+
+    // Dựng quạt tăng từ 4 đáy gần nhất
+    if (loBar.length >= 4) {
+      const m = loBar.length;
+      const oB = loBar[m - 4];
+      const oV = loVal[m - 4];
+      const b1 = loBar[m - 3];
+      const v1 = loVal[m - 3];
+      const b2 = loBar[m - 2];
+      const v2 = loVal[m - 2];
+      const b3 = loBar[m - 1];
+      const v3 = loVal[m - 1];
+      const fresh = i - oB <= F.maxFanBars;
+      const legOk = oV !== 0 && (Math.abs(v1 - oV) / oV) * 100 >= F.minLegPct;
+      if (
+        fresh &&
+        legOk &&
+        b1 > oB &&
+        b2 > b1 &&
+        b3 > b2 &&
+        (fanDir !== -1 || b3 > fL3Bar)
+      ) {
+        originBar = oB;
+        originVal = oV;
+        fanDir = 1;
+        fL2Val = v2;
+        fL3Bar = b3;
+        fL3Val = v3;
+        fanM3 = slope(oB, oV, b3, v3);
+      }
+    }
+
+    // Dựng quạt giảm từ 4 đỉnh gần nhất
+    if (hiBar.length >= 4) {
+      const m = hiBar.length;
+      const oB = hiBar[m - 4];
+      const oV = hiVal[m - 4];
+      const b1 = hiBar[m - 3];
+      const v1 = hiVal[m - 3];
+      const b2 = hiBar[m - 2];
+      const v2 = hiVal[m - 2];
+      const b3 = hiBar[m - 1];
+      const v3 = hiVal[m - 1];
+      const fresh = i - oB <= F.maxFanBars;
+      const legOk = oV !== 0 && (Math.abs(v1 - oV) / oV) * 100 >= F.minLegPct;
+      if (
+        fresh &&
+        legOk &&
+        b1 > oB &&
+        b2 > b1 &&
+        b3 > b2 &&
+        (fanDir !== 1 || b3 > fL3Bar)
+      ) {
+        originBar = oB;
+        originVal = oV;
+        fanDir = -1;
+        fL2Val = v2;
+        fL3Bar = b3;
+        fL3Val = v3;
+        fanM3 = slope(oB, oV, b3, v3);
+      }
+    }
+  }
+
+  const n = bars.length - 1;
+
+  if (fanM3 == null || fanDir === 0 || n < 3) {
+    return { signal: null, levels: null, reason: "", debug: { fanDir, quatChuaDung: true } };
+  }
+
+  const lineAt = (x) => originVal + fanM3 * (x - originBar);
+  const fanPrev = lineAt(n - 1); // giá trị đường quạt 3 tại nến trước
+  const fanPrev2 = lineAt(n - 2);
+
+  // Pine kiểm tra phá vỡ trên close[1] so với close[2]
+  const bullBreak =
+    fanDir === 1 && closes[n - 1] > fanPrev && closes[n - 2] <= fanPrev2;
+  const bearBreak =
+    fanDir === -1 && closes[n - 1] < fanPrev && closes[n - 2] >= fanPrev2;
+
+  const signal = bullBreak ? "long" : bearBreak ? "short" : null;
+
+  let levels = null;
+  const aPrev = atrArr[n - 1];
+  const aNow = atrArr[n];
+
+  if (signal && aPrev != null && aNow != null) {
+    const entry = closes[n - 1];
+    let risk;
+    if (bullBreak) {
+      const chanQuat = Math.min(fL2Val, fL3Val);
+      const rawSl = chanQuat - aPrev * F.slBufAtr;
+      const sanSl = entry - aPrev * F.slMaxAtr; // trần rủi ro
+      risk = entry - Math.max(rawSl, sanSl);
+    } else {
+      const chanQuat = Math.max(fL2Val, fL3Val);
+      const rawSl = chanQuat + aPrev * F.slBufAtr;
+      const tranSl = entry + aPrev * F.slMaxAtr;
+      risk = Math.min(rawSl, tranSl) - entry;
+    }
+    if (risk > 0) {
+      levels = makeLevels(bullBreak, entry, risk, aNow, [F.tp1R, F.tp2R, F.tp3R]);
+    }
+  }
+
+  const huong = bullBreak ? "lên" : "xuống";
+  const nguon = bullBreak ? "4 đáy" : "4 đỉnh";
+
+  return {
+    signal: levels ? signal : null,
+    levels,
+    reason: signal
+      ? `Giá phá ${huong} đường quạt số 3 (mức ${p(fanPrev)}), quạt dựng từ ${nguon} liên tiếp.`
+      : "",
+    debug: {
+      fanDir,
+      quat3HienTai: round(lineAt(n), 3),
+      quat3NenTruoc: round(fanPrev, 3),
+      soDay: loBar.length,
+      soDinh: hiBar.length,
+    },
+  };
 }
 
-function p(v) {
-  return v.toFixed(PRICE_DECIMALS);
-}
-
-// ── LÝ DO VÀO LỆNH (ngắn gọn) ──────────────────────────────────
-function buildReason(dir, r) {
-  const isBuy = dir === "long";
-  const vung = isBuy
-    ? `vùng tăng (${CFG.bullLo}–${CFG.bullHi})`
-    : `vùng giảm (${CFG.bearLo}–${CFG.bearHi})`;
-  const viTri = isBuy ? "trên" : "dưới";
-  return `RSI ${r.rsi.toFixed(1)} nằm trong ${vung}, giá nằm ${viTri} SMA50.`;
-}
+// ── DANH SÁCH CHỈ BÁO ──────────────────────────────────────────
+// Thêm chỉ báo mới: viết hàm analyzeXxx rồi thêm một dòng vào đây.
+const INDICATORS = [
+  { ten: "Cardwell Range Analyze", chay: analyzeCardwell },
+  { ten: "Fan Principle Signals", chay: analyzeFan },
+];
 
 // ── TẢI DỮ LIỆU ────────────────────────────────────────────────
 async function fetchBars(symbol) {
@@ -276,7 +464,7 @@ async function sendMessage(text) {
   }
 }
 
-function buildMessage(dir, lv, reason) {
+function buildMessage(dir, lv, reason, nguon) {
   const side = dir === "long" ? "BUY" : "SELL";
 
   const lines = [
@@ -288,7 +476,8 @@ function buildMessage(dir, lv, reason) {
 
   if (SHOW_TP3) lines.push(`TP3: <code>${p(lv.tp3)}</code>`);
 
-  lines.push(``, `📌 <b>Lý do vào lệnh:</b>`, buildReason(dir, reason));
+  lines.push(``, `📌 <b>Lý do vào lệnh:</b>`, reason);
+  lines.push(``, `<i>Nguồn: ${nguon}</i>`);
 
   return lines.join("\n");
 }
@@ -317,46 +506,54 @@ export default async function handler(req, res) {
   for (const symbol of SYMBOLS) {
     try {
       const bars = await fetchBars(symbol);
-      if (bars.length < CFG.trendLen + 5) {
+      if (bars.length < 100) {
         results.push({ symbol, error: "Không đủ dữ liệu", bars: bars.length });
         continue;
       }
 
-      const r = analyze(bars);
-      const barAgeMin = Math.round((Date.now() - (r.barTs + 3600 * 1000)) / 60000);
+      const lastTs = bars[bars.length - 1].ts;
+      const barAgeMin = Math.round((Date.now() - (lastTs + 3600 * 1000)) / 60000);
       const isFresh = barAgeMin <= MAX_BAR_AGE_MIN;
+      const barTime = bars[bars.length - 1].datetime;
 
-      let sent = false;
-      let skipReason = null;
-      let telegram = null;
+      for (const ind of INDICATORS) {
+        const r = ind.chay(bars);
 
-      if (testMode && r.levels) {
-        telegram = await sendMessage(
-          buildMessage(r.signal || "short", r.levels, r.reason) +
-            `\n\n⚠️ <i>Tin nhắn thử — không phải tín hiệu thật</i>`
-        );
-        sent = telegram?.ok === true;
-      } else if (r.signal && !r.levels) {
-        skipReason = "thiếu ATR";
-      } else if (r.signal && !isFresh) {
-        skipReason = "nến cũ, bỏ qua để tránh gửi trùng";
-      } else if (r.signal) {
-        telegram = await sendMessage(buildMessage(r.signal, r.levels, r.reason));
-        sent = telegram?.ok === true;
+        let sent = false;
+        let skipReason = null;
+        let telegram = null;
+
+        if (testMode && r.levels) {
+          telegram = await sendMessage(
+            buildMessage(r.signal || "short", r.levels, r.reason, ind.ten) +
+              `\n\n⚠️ <i>Tin nhắn thử — không phải tín hiệu thật</i>`
+          );
+          sent = telegram?.ok === true;
+        } else if (r.signal && !r.levels) {
+          skipReason = "thiếu mức giá";
+        } else if (r.signal && !isFresh) {
+          skipReason = "nến cũ, bỏ qua để tránh gửi trùng";
+        } else if (r.signal) {
+          telegram = await sendMessage(
+            buildMessage(r.signal, r.levels, r.reason, ind.ten)
+          );
+          sent = telegram?.ok === true;
+        }
+
+        results.push({
+          symbol,
+          chiBao: ind.ten,
+          signal: r.signal,
+          sent,
+          skipReason,
+          telegramError: telegram && !telegram.ok ? telegram.description : null,
+          barTime,
+          barAgeMin,
+          isFresh,
+          barsUsed: bars.length,
+          ...(debugMode ? { debug: r.debug, levels: r.levels } : {}),
+        });
       }
-
-      results.push({
-        symbol,
-        signal: r.signal,
-        sent,
-        skipReason,
-        telegramError: telegram && !telegram.ok ? telegram.description : null,
-        barTime: r.barTime,
-        barAgeMin,
-        isFresh,
-        barsUsed: bars.length,
-        ...(debugMode ? { debug: r.debug, levels: r.levels } : {}),
-      });
     } catch (err) {
       console.error(`Lỗi với ${symbol}:`, err.message);
       results.push({ symbol, error: err.message });
