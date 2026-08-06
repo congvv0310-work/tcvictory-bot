@@ -1,6 +1,6 @@
 // api/scan.js — Quét tín hiệu M5 từ UT Bot + Nadaraya-Watson Envelope → Telegram
 // Chỉ báo: UT Bot Alerts + Nadaraya-Watson Envelope (LuxAlgo) + veto thân nến
-// Bản non-repaint (endpoint) — tín hiệu chốt tại GIÁ ĐÓNG CỬA của nến đã đóng.
+// Hỗ trợ 2 chế độ NWE: REPAINT (two-sided, giống hệt LuxAlgo gốc) và non-repaint (endpoint).
 // Biến môi trường: BOT_TOKEN, GROUP_ID, TD_API_KEY, CRON_SECRET
 // Tùy chọn: SYMBOLS (mặc định "XAU/USD")
 
@@ -31,10 +31,11 @@ const UTNWE = {
   utKey: 1.0,        // Key Value (sensitivity)
   utAtrLen: 10,      // ATR Period
 
-  // Nadaraya-Watson Envelope (non-repaint / endpoint)
+  // Nadaraya-Watson Envelope
+  repaint: true,     // ★ true = REPAINT (two-sided, giống mặc định TradingView) | false = endpoint
   nwH: 8.0,          // Bandwidth
   nwMult: 3.0,       // hệ số độ rộng band
-  nwWindow: 500,     // số nến trong kernel Gauss
+  nwWindow: 500,     // số nến trong kernel Gauss (chỉ dùng cho chế độ endpoint)
 
   // Veto kích thước thân nến (open→close, KHÔNG tính râu)
   bodyAtrLen: 14,
@@ -118,7 +119,7 @@ function utTrailingStop(bars, keyValue, atrLen) {
   return stop;
 }
 
-// ── NADARAYA-WATSON: đường trung tâm non-repaint (endpoint) ─────
+// ── NADARAYA-WATSON: endpoint (non-repaint) ────────────────────
 function nwEndpoint(bars, h, window) {
   const closes = bars.map((b) => b.close);
   const N = Math.min(window, 500);
@@ -133,9 +134,44 @@ function nwEndpoint(bars, h, window) {
     let s = 0;
     const lim = Math.min(N - 1, t);
     for (let i = 0; i <= lim; i++) s += closes[t - i] * coefs[i];
-    out[t] = s / den; // trọng số Gauss suy giảm nhanh nên chia den đầy đủ vẫn khớp
+    out[t] = s / den;
   }
   return out;
+}
+
+// ── NADARAYA-WATSON: REPAINT (two-sided) — GIỐNG HỆT LuxAlgo gốc ─
+// Với cửa sổ hiện tại, tính đường trung tâm hai chiều nwe[i] (i=0 là nến vừa đóng),
+// rồi sae = trung bình |giá - trung tâm| của cả cửa sổ × mult (một hằng số).
+// Band tại nến hiện tại = nwe[0] ± sae. Tương đương nhánh:
+//   for i: for j: w=gauss(i-j,h); sum+=src[j]*w; sumw+=w; y2=sum/sumw
+//   sae += |src[i]-y2|;  sae = sae / min(499,n-1) * mult
+//   buyAlert := ... low <= nwe.get(0) - sae ;  sellAlert := ... high >= nwe.get(0) + sae
+// Lưu ý repaint: các giá trị này được tính lại khi có nến mới; nhưng tại nến vừa đóng
+// (i=0) phép tính chỉ dùng dữ liệu tới hiện tại, và bot bắn 1 lần, không sửa lại.
+function nwRepaint(bars, h, mult) {
+  const closes = bars.map((b) => b.close);
+  const n = bars.length - 1;
+  const L = Math.min(499, n - 1); // math.min(499, n-1)
+  if (L < 1) return { center: null, sae: null };
+
+  const nwe = new Array(L + 1);
+  for (let i = 0; i <= L; i++) {
+    let sum = 0, sumw = 0;
+    for (let j = 0; j <= L; j++) {
+      const w = Math.exp(-((i - j) * (i - j)) / (h * h * 2)); // gauss(i - j, h)
+      sum += closes[n - j] * w;   // src[j] = close tại n-j
+      sumw += w;
+    }
+    nwe[i] = sum / sumw;          // y2
+  }
+
+  let sae = 0;
+  for (let i = 0; i <= L; i++) {
+    sae += Math.abs(closes[n - i] - nwe[i]); // |src[i] - nwe[i]|
+  }
+  sae = (sae / L) * mult;         // sae / min(499,n-1) * mult
+
+  return { center: nwe[0], sae }; // band nến hiện tại = center ± sae
 }
 
 // ── CHỈ BÁO: UT BOT + NADARAYA-WATSON ──────────────────────────
@@ -146,20 +182,33 @@ function analyzeUtNwe(bars) {
 
   const closes = bars.map((b) => b.close);
   const stop = utTrailingStop(bars, U.utKey, U.utAtrLen);
-  const out = nwEndpoint(bars, U.nwH, U.nwWindow);
   const atrBody = atr(bars, U.bodyAtrLen);
   const atrSl = atr(bars, U.slAtrLen);
 
-  // mae = SMA( |close - out|, 499 ) × mult  → band trên/dưới tại nến n
-  let sum = 0, cnt = 0;
-  for (let t = Math.max(0, n - 498); t <= n; t++) {
-    if (out[t] == null) continue;
-    sum += Math.abs(closes[t] - out[t]);
-    cnt++;
+  // ── Band NWE tại nến n theo chế độ đã chọn ──
+  let nwCenter = null, upper = null, lower = null, saeVal = null;
+  if (U.repaint) {
+    const rp = nwRepaint(bars, U.nwH, U.nwMult);
+    nwCenter = rp.center;
+    saeVal = rp.sae;
+    if (nwCenter != null && saeVal != null) {
+      upper = nwCenter + saeVal;
+      lower = nwCenter - saeVal;
+    }
+  } else {
+    const out = nwEndpoint(bars, U.nwH, U.nwWindow);
+    let sum = 0, cnt = 0;
+    for (let t = Math.max(0, n - 498); t <= n; t++) {
+      if (out[t] == null) continue;
+      sum += Math.abs(closes[t] - out[t]);
+      cnt++;
+    }
+    const mae = cnt ? (sum / cnt) * U.nwMult : null;
+    nwCenter = out[n];
+    saeVal = mae;
+    upper = out[n] != null && mae != null ? out[n] + mae : null;
+    lower = out[n] != null && mae != null ? out[n] - mae : null;
   }
-  const mae = cnt ? (sum / cnt) * U.nwMult : null;
-  const upper = out[n] != null && mae != null ? out[n] + mae : null;
-  const lower = out[n] != null && mae != null ? out[n] - mae : null;
 
   // UT Bot crossover tại nến n (close cắt trailing-stop)
   const c = closes[n], cP = closes[n - 1];
@@ -176,9 +225,11 @@ function analyzeUtNwe(bars) {
   const plotSell = sellRaw && upper != null && bars[n].high >= upper && bodyOk;
 
   const debug = {
+    mode: U.repaint ? "repaint" : "non-repaint",
     close: round(c, 3),
     trailingStop: round(sN, 3),
-    nwCenter: round(out[n], 3),
+    nwCenter: round(nwCenter, 3),
+    sae: round(saeVal, 3),
     bandTren: round(upper, 3),
     bandDuoi: round(lower, 3),
     bodyOk,
