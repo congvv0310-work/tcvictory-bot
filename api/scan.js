@@ -2,10 +2,11 @@
 // Chỉ báo: UT Bot Alerts + Nadaraya-Watson Envelope (LuxAlgo) + veto thân nến
 // Hỗ trợ 2 chế độ NWE: REPAINT (two-sided, giống hệt LuxAlgo gốc) và non-repaint (endpoint).
 // Biến môi trường: BOT_TOKEN, GROUP_ID, TD_API_KEY, CRON_SECRET
-// Tùy chọn: SYMBOLS (mặc định "XAU/USD")
+// Tùy chọn: SYMBOLS (mặc định "XAU/USD"), THREAD_ID (ID topic trong group có topic)
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const GROUP_ID = process.env.GROUP_ID;
+const THREAD_ID = process.env.THREAD_ID;
 const TD_API_KEY = process.env.TD_API_KEY;
 const CRON_SECRET = process.env.CRON_SECRET || "";
 
@@ -290,7 +291,10 @@ async function sendMessage(text) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        chat_id: GROUP_ID, text,
+        chat_id: GROUP_ID,
+        // Có THREAD_ID → gửi vào đúng topic; không có → gửi như group thường
+        ...(THREAD_ID ? { message_thread_id: Number(THREAD_ID) } : {}),
+        text,
         parse_mode: "HTML", disable_web_page_preview: true,
       }),
     });
